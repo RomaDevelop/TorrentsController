@@ -11,6 +11,29 @@
 #include "MyQDifferent.h"
 #include "MyQDialogs.h"
 #include "MyQFileDir.h"
+#include "MyQExecute.h"
+
+QString TorrentData::SetUploadedAndWrite(uint64_t newValue)
+{
+	if(uploaded.value.isEmpty() or uploaded.len == uploaded.undefined or uploaded.pos == uploaded.undefined)
+		return "uploaded value is undefined";
+
+	if(not fastresume.fi.isFile() or fastresume.fi.isSymLink())
+		return "fastresume is wrong";
+
+	if(fastresume.content.isEmpty())
+		return "fastresume content is empty";
+
+	if(uploaded.pos+uploaded.len >= fastresume.content.size())
+		return "fastresume content is to short";
+
+	fastresume.content.replace(uploaded.pos, uploaded.len, QSn(newValue).toUtf8());
+
+	if(not WidgetTorrentsController::WriteFile(fastresume.fi, fastresume.content))
+		return "error writing file";
+
+	return "";
+}
 
 WidgetTorrentsController::WidgetTorrentsController(QWidget *parent)
 	: QWidget(parent)
@@ -27,6 +50,10 @@ WidgetTorrentsController::WidgetTorrentsController(QWidget *parent)
 	hlo1->addWidget(btnScan);
 	connect(btnScan,&QPushButton::clicked, this, &WidgetTorrentsController::SlotScan);
 
+	QPushButton *btnSetUploaded = new QPushButton("Set uploaded");
+	hlo1->addWidget(btnSetUploaded);
+	connect(btnSetUploaded,&QPushButton::clicked, this, &WidgetTorrentsController::SlotSetUploaded);
+
 	hlo1->addStretch();
 
 	table = new QTableWidget;
@@ -39,6 +66,8 @@ WidgetTorrentsController::WidgetTorrentsController(QWidget *parent)
 		table->setColumnWidth(1, width*0.15);
 	});
 	hlo2->addWidget(table);
+
+	CreateTableMenu();
 }
 
 QString fastresume = "fastresume";
@@ -53,8 +82,9 @@ void WidgetTorrentsController::SlotScan()
 	QString appDataPath = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
 	QString qBittorrentPath = appDataPath + "/qBittorrent/BT_backup";
 
-	std::map<QString, TorrentData> torrents;
-	std::map<QString, TorrentData*> torrentsByDownloadName;
+	torrentsInTableOrder.clear();
+	torrentsByDownloadName.clear();
+	torrents.clear();
 
 	QStringList errors;
 
@@ -104,10 +134,14 @@ void WidgetTorrentsController::SlotScan()
 		}
 
 		auto getRes = GetIValue(total_uploaded, torrent.fastresume.content);
-		if(getRes.error.isEmpty()) torrent.uploaded = getRes.text;
+		if(getRes.error.isEmpty())
+		{
+			torrent.uploaded = getRes.iValue;
+			torrent.uploaderReadable = MyQString::BytesToString(torrent.uploaded.value.toULongLong());
+		}
 		else
 		{
-			errors += "Can't define uploaded by file "+torrent.fastresume.fi.fileName();
+			errors += "Can't define uploaded by file "+torrent.fastresume.fi.fileName()+" error: "+getRes.error;
 			//qdbg << "error "+getRes.error;
 		}
 		//qdbg << torrent.torrentDownloadName;
@@ -153,8 +187,57 @@ void WidgetTorrentsController::SlotScan()
 		table->setRowCount(table->rowCount()+1);
 		int row = table->rowCount()-1;
 		table->setItem(row, 0, new QTableWidgetItem(t.torrentDownloadName));
-		table->setItem(row, 1, new QTableWidgetItem(MyQString::BytesToString(t.uploaded.toULongLong())));
+		table->setItem(row, 1, new QTableWidgetItem(t.uploaderReadable));
+
+		torrentsInTableOrder.push_back(&t);
 	}
+}
+
+void WidgetTorrentsController::SlotSetUploaded()
+{
+	if(torrents.empty()) return;
+
+	QStringList torrentsStrs;
+	for(auto &t:torrentsInTableOrder) torrentsStrs += t->torrentDownloadName + " (current "+t->uploaderReadable+")";
+	auto res = MyQDialogs::CheckBoxDialog("Choose torrents to reset uploaded value", torrentsStrs, {}, {}, false, 1260, 640);
+
+	if(res.accepted == false or res.checkedIndexes.empty()) return;
+
+	QStringList errors;
+	for(auto index:res.checkedIndexes)
+	{
+		auto t = TorrentByRow(index, false);
+		if(!t) errors += "row "+QSn(index)+" ("+res.allItems[index].text+") is invalid";
+		else
+		{
+			if(auto setRes = t->SetUploadedAndWrite(0); setRes.isEmpty() == false)
+				errors += "Error upload set: "+setRes;
+		}
+	}
+
+	if(errors.isEmpty()) QMbInfo("Сompleted successfully");
+	else
+	{
+		errors.prepend("Сompleted with errors: ");
+		MyQDialogs::ShowText(errors);
+	}
+}
+
+TorrentData * WidgetTorrentsController::TorrentByRow(int row, bool showErrorMsg)
+{
+	if(row < 0 or row >= (int)torrentsInTableOrder.size())
+	{
+		if(showErrorMsg) QMbError("Cant define current torrent: invalid row "+QSn(row));
+		return nullptr;
+	}
+
+	return torrentsInTableOrder[row];
+}
+
+TorrentData * WidgetTorrentsController::CurrentTorrent()
+{
+	auto row = table->currentRow();
+	return TorrentByRow(row);
 }
 
 ReadRes WidgetTorrentsController::ReadFile(const QFileInfo & fi)
@@ -166,6 +249,41 @@ ReadRes WidgetTorrentsController::ReadFile(const QFileInfo & fi)
 	}
 
 	return ReadRes({},false);
+}
+
+bool WidgetTorrentsController::WriteFile(const QFileInfo & fi, const QByteArray & content)
+{
+	QFile file(fi.filePath());
+	if(file.open(QFile::WriteOnly))
+	{
+		file.write(content);
+		return true;
+	}
+	return false;
+}
+
+void WidgetTorrentsController::CreateTableMenu()
+{
+	table->setContextMenuPolicy(Qt::ActionsContextMenu);
+
+	table->addAction(new QAction("Показать в проводнике", this));
+	connect(table->actions().back(), &QAction::triggered, this, [this](){
+		auto torrent = CurrentTorrent();
+		if(!torrent) return;
+
+		if(not MyQExecute::ShowInExplorer(torrent->fastresume.fi.filePath()))
+			QMbError("Can't show file");
+	});
+
+	table->addAction(new QAction("Сбросить uploaded", this));
+	connect(table->actions().back(), &QAction::triggered, this, [this](){
+		auto torrent = CurrentTorrent();
+		if(!torrent) return;
+
+		if(auto setRes = torrent->SetUploadedAndWrite(0); setRes.isEmpty() == false)
+			QMbError("Error upload set: "+setRes);
+		else QMbInfo("Выполнено успешно");
+	});
 }
 
 bool WidgetTorrentsController::DefineName(const QString & keywordName, TorrentData & torrent, TorrentPart & part, QStringList & errors)
@@ -220,25 +338,30 @@ TextAndError WidgetTorrentsController::GetBytesValue(const QString &valueName, c
 	return TextAndError(name,"");
 }
 
-TextAndError WidgetTorrentsController::GetIValue(const QString & valueName, const QByteArray & content)
+IValueAndError WidgetTorrentsController::GetIValue(const QString & valueName, const QByteArray & content)
 {
 	QString valueNameI = valueName + "i";
 	QByteArray valueIByArr = valueNameI.toUtf8();
 	auto index = content.indexOf(valueIByArr);
-	if(index == -1) return TextAndError("",valueName+" not fount");
+	if(index == -1) return IValueAndError({},valueName+" not fount");
 
 	int indexStartIValue = index+valueIByArr.size();
-	if(content.size() <= indexStartIValue) return TextAndError("","unepected content end");
+	if(content.size() <= indexStartIValue) return IValueAndError({},"unepected content end");
 
 	auto endIndex = content.indexOf("e8", indexStartIValue);
-	if(endIndex == -1) return TextAndError("","after "+valueName+"i e8 not fount");
+	if(endIndex == -1) return IValueAndError({},"after "+valueName+"i e8 not fount");
 
-	auto value = content.mid(indexStartIValue, endIndex-indexStartIValue);
+	IValueAndError ret;
+	ret.iValue.pos = indexStartIValue;
+	ret.iValue.len = endIndex-indexStartIValue;
+
+	auto value = content.mid(ret.iValue.pos, ret.iValue.len);
 	QString valueStr = value;
 	bool ok;
 	QString(valueStr).toULongLong(&ok);
-	if(not ok) return TextAndError("","after "+valueNameI+" incorrect value "+QString(valueStr));
+	if(not ok) return IValueAndError({},"after "+valueNameI+" incorrect value "+QString(valueStr));
 
-	return TextAndError(std::move(valueStr),"");
+	ret.iValue.value = std::move(valueStr);
+
+	return ret;
 }
-
